@@ -1,0 +1,55 @@
+Token = IFR:0x7:Setup:0xD2D
+Setup Question = BIOS Menu Expert Mode
+Value of Question = Disabled
+
+Token = IFR:0x8:Setup:0xD30
+Setup Question = PTID Support
+Value of Question = Enabled
+
+Token = IFR:0x9:Setup:0xD33
+Setup Question = Above 4G Decoding
+Value of Question = Enabled
+
+Token = IFR:0xA:Setup:0xD36
+Setup Question = Native PCIE Enable
+Value of Question = Disabled
+
+Token = IFR:0xB:Setup:0xD39
+Setup Question = Secure Boot
+Value of Question = Disabled
+
+Token = IFR:0xC:Setup:0xD3C
+Setup Question = TPM Device Selection
+Value of Question = PTT
+
+Token = IFR:0xD:Setup:0xD3F
+Setup Question = Intel (VMX) Virtualization Technology
+Value of Question = Enabled
+
+Token = IFR:0xE:Setup:0xD42
+Setup Question = I2C Address
+Value of Question = 0x30
+
+Token = IFR:0xF:Setup:0xD45
+Setup Question = I2C Address
+Value of Question = 0x44
+
+Token = IFR:0x10:Setup:0xD48
+Setup Question = I2C Address
+Value of Question = 0x51
+
+Token = IFR:0x11:Setup:0xD4B
+Setup Question = Wake on LAN Enable
+Value of Question = Enabled
+
+Token = IFR:0x12:Setup:0xD4E
+Setup Question = State After G3
+Value of Question = S0 State
+
+Token = IFR:0x13:Setup:0xD51
+Setup Question = Stop Bits
+Value of Question = 1
+
+Token = IFR:0x14:Setup:0xD54
+Setup Question = 11Ax Mode for Russia
+Value of Question = Disabled

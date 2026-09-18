@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Decode a raw flashrom SPI BIOS dump into the same normalized "Token/Setup
+Question/Value" text format bios-settings-diff already understands, so a unit
+that never got an SCEWIN capture still gets a named, diffable settings list.
+
+How it works (validated against a real industrial-board BIOS image):
+  1. uefiextract splits the raw image into its component tree, including the
+     BIOS's own compiled Setup form driver (a PE32 module literally named
+     "Setup") and named per-subsystem NVRAM stores (Setup, CpuSetup, PchSetup,
+     SecureBootSetup, etc.) - each with header.bin/body.bin already correctly
+     split (verified: body.bin size matches the IFR-declared payload size
+     exactly, e.g. CpuSetup = 963 bytes on both sides).
+  2. ifrextractor decompiles that Setup module's IFR forms into plain text:
+     every question's Prompt, its VarStoreId + byte VarOffset, and (for
+     OneOf/CheckBox) its option value->label mapping. VarStore declaration
+     lines separately map VarStoreId -> which named NVRAM store holds it.
+  3. For each decodable question, read the byte(s) at VarOffset out of that
+     store's body.bin and match against the option list to get a real
+     current value - e.g. "Secure Boot = Enabled", not just a CRC.
+Confirmed against known manufacturer-default values (VMX Virtualization byte
+at CpuSetup+0xB9 read back 1/Enabled, PECI at CpuSetup+0x4 read back
+1/Enabled, both matching the IFR's stated MfgDefault) - the mechanism is
+sound. Not yet run against a genuinely live (post-boot) unit's dump, only
+against manufacturer BIOS update images, which only carry default-value
+NVRAM copies (nested under "StdDefaults" / "NVRAM external defaults" in the
+dump tree) rather than a live top-level store. This script prefers a live
+top-level store when present and falls back to the defaults copy - labeled
+as such in the output - when it's all that exists.
+
+Any question this can't resolve (VarStoreId with no matching named store, or
+that store's data not found anywhere in the image) falls back to the old
+per-store CRC32 tripwire rather than being silently dropped.
+
+Usage:
+    bios-settings-decode BIOS.bin --model TB-6293 --serial SN12345 [--out DIR]
+
+Requires: uefiextract, ifrextractor (both in /usr/local/bin)
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+UEFIEXTRACT = "/usr/local/bin/uefiextract"
+IFREXTRACTOR = "/usr/local/bin/ifrextractor"
+CAPTURES_DIR = Path(os.environ.get("BIOS_SETTINGS_HOME",
+                                   Path.home() / ".local/share/bios-settings")) / "captures"
+
+NVAR_LINE_RE = re.compile(
+    r"^\s*NVAR entry\s*\|\s*(?P<subtype>\S+)\s*\|\s*(?P<offset>\S+)\s*\|\s*"
+    r"(?P<size>\S+)\s*\|\s*(?P<crc>\S+)\s*\|\s*[\- ]*"
+    r"(?P<guid>[0-9A-Fa-f-]{36})\s*\|\s*(?P<name>.+?)\s*$"
+)
+
+VARSTORE_RE = re.compile(
+    r'VarStore\w* Guid: (?P<guid>[0-9A-Fa-f-]{36}), VarStoreId: (?P<vsid>0x[0-9A-Fa-f]+)'
+    r'(?:, Attributes: 0x[0-9A-Fa-f]+)?, Size: (?P<size>0x[0-9A-Fa-f]+), Name: "(?P<name>[^"]*)"'
+)
+
+QUESTION_HEADER_RE = re.compile(
+    r'^(?P<indent>\s*)(?P<kind>OneOf|CheckBox|Numeric) Prompt: "(?P<prompt>(?:[^"\\]|\\.)*)", '
+    r'Help: "(?P<help>(?:[^"\\]|\\.)*)", '
+    r'QuestionFlags: 0x[0-9A-Fa-f]+, QuestionId: (?P<qid>0x[0-9A-Fa-f]+), '
+    r'VarStoreId: (?P<vsid>0x[0-9A-Fa-f]+), VarOffset: (?P<voff>0x[0-9A-Fa-f]+), '
+    r'Flags: 0x[0-9A-Fa-f]+'
+    r'(?:, Default: (?P<default>\w+))?(?:, MfgDefault: (?P<mfgdefault>\w+))?'
+    r'(?:, Size: (?P<size>\d+))?'
+    r'(?:, Min: 0x(?P<min>[0-9A-Fa-f]+))?(?:, Max: 0x(?P<max>[0-9A-Fa-f]+))?(?:, Step: 0x(?P<step>[0-9A-Fa-f]+))?'
+)
+
+# EFI_IFR_CHECKBOX is always a single boolean byte - it has no OneOfOption
+# child lines (Default/MfgDefault are inline on the header instead), so
+# without this it silently falls back to raw hex for every CheckBox
+# question (confirmed: 110 of 982 unlabeled entries were CheckBox, not
+# genuinely option-less Numeric ones).
+CHECKBOX_OPTIONS = {0: "Disabled", 1: "Enabled"}
+
+OPTION_RE = re.compile(r'OneOfOption Option: "(?P<label>(?:[^"\\]|\\.)*)" Value: (?P<value>0x[0-9A-Fa-f]+|\d+)')
+DEFAULT_LINE_RE = re.compile(r'^\s*Default DefaultId:')
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+QUESTION_START_RE = re.compile(r"^\s*(OneOf|CheckBox|Numeric) Prompt:")
+
+
+def join_wrapped_question_lines(text: str) -> str:
+    """Some Help strings contain literal embedded newlines (confirmed: Secure
+    Boot's own toggle). A whole-document "collapse every quoted span" pass
+    is NOT safe here - some Help/Prompt text elsewhere in this ~36k-line
+    file contains an unescaped quote character, which desyncs quote-pair
+    matching for everything after it and silently corrupts unrelated,
+    far-later lines (confirmed: it merged Secure Boot's Default/OneOfOption
+    lines into the wrong place, and undercounted questions 676 vs ~4800
+    real ones). Instead, only join when a question header line is actually
+    incomplete: every complete header always has "QuestionId:" on its
+    closing line, so keep pulling in subsequent lines only until that
+    appears - far narrower blast radius than a document-wide quote scan."""
+    lines = text.splitlines()
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if QUESTION_START_RE.match(line) and "QuestionId:" not in line:
+            joined = line.rstrip()
+            i += 1
+            while i < len(lines) and "QuestionId:" not in lines[i]:
+                joined += " " + lines[i].strip()
+                i += 1
+            if i < len(lines):
+                joined += " " + lines[i].strip()
+                i += 1
+            out.append(joined)
+        else:
+            out.append(line)
+            i += 1
+    return "\n".join(out)
+
+
+def uefiextract_all(bin_path: Path, workdir: Path) -> Path:
+    local_bin = workdir / bin_path.name
+    shutil.copy(bin_path, local_bin)
+    run([UEFIEXTRACT, local_bin.name, "all"], cwd=workdir)
+    dump_dir = workdir / f"{local_bin.name}.dump"
+    report = workdir / f"{local_bin.name}.report.txt"
+    if not dump_dir.exists() or not report.exists():
+        print("error: uefiextract did not produce a dump tree", file=sys.stderr)
+        sys.exit(2)
+    return dump_dir, report
+
+
+def parse_nvar_entries(report_path: Path):
+    entries = {}
+    for line in report_path.read_text(errors="replace").splitlines():
+        m = NVAR_LINE_RE.match(line)
+        if not m or m.group("offset").upper() == "N/A":
+            continue
+        key = f"{m.group('guid').lower()}::{m.group('name')}"
+        entries[key] = {"guid": m.group("guid"), "name": m.group("name"),
+                         "size": m.group("size"), "crc": m.group("crc")}
+    return entries
+
+
+def find_setup_module(dump_dir: Path) -> Path | None:
+    # Fast path: AMI names the main setup form driver "Setup" - try that exact
+    # folder name first.
+    direct = [p for p in dump_dir.rglob("body.bin")
+              if re.match(r"^\d+ Setup$", p.parent.parent.name)
+              and p.parent.name == "1 PE32 image section"]
+    search_pool = direct
+    if not search_pool:
+        # Slow path: scan every PE32 module for one that actually has a large
+        # form package (the real Setup Utility driver, not an unrelated hit).
+        all_bodies = list(dump_dir.rglob("body.bin"))
+        pe32 = []
+        for b in all_bodies:
+            head = b.open("rb").read(2)
+            if head == b"MZ":
+                pe32.append(b)
+        search_pool = pe32
+
+    best, best_strings = None, -1
+    for c in search_pool:
+        out = run([IFREXTRACTOR, str(c), "list"]).stdout
+        m = re.search(r"Used strings: (\d+)", out)
+        if m and int(m.group(1)) > best_strings:
+            best, best_strings = c, int(m.group(1))
+    return best
+
+
+def extract_ifr_catalog(setup_module: Path) -> str | None:
+    run([IFREXTRACTOR, str(setup_module), "lang", "en-US"])
+    outputs = sorted(setup_module.parent.glob(f"{setup_module.name}.*.en-US.uefi.ifr.txt"),
+                      key=lambda p: p.stat().st_size, reverse=True)
+    if not outputs:
+        return None
+    return outputs[0].read_text(errors="replace")
+
+
+def parse_varstores(text: str):
+    varstores = {}
+    for m in VARSTORE_RE.finditer(text):
+        varstores[int(m.group("vsid"), 16)] = {
+            "guid": m.group("guid"), "size": int(m.group("size"), 16), "name": m.group("name")
+        }
+    return varstores
+
+
+def parse_questions(text: str):
+    """Scan line by line for OneOf/CheckBox/Numeric headers. Any immediately
+    following "Default DefaultId:" or "OneOfOption Option:" lines belong to
+    that question; anything else (a nested SuppressIf/Form/other Question,
+    regardless of its indentation) ends the block. Indentation alone is NOT
+    a safe block boundary here - nested form structure is often MORE
+    indented than a question's own option list, and treating "more indented
+    than the header" as "belongs to this question" silently swallows real
+    questions (e.g. Secure Boot's own toggle sits inside a deeper SuppressIf
+    a few lines after an unrelated shallower question - confirmed by a 676
+    vs ~4800 question-count mismatch before this fix)."""
+    lines = text.splitlines()
+    questions = []
+    i = 0
+    while i < len(lines):
+        m = QUESTION_HEADER_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        options = {}
+        j = i + 1
+        while j < len(lines):
+            line = lines[j]
+            om = OPTION_RE.search(line)
+            if om:
+                options[int(om.group("value"), 16 if om.group("value").startswith("0x") else 10)] = om.group("label")
+                j += 1
+                continue
+            if DEFAULT_LINE_RE.match(line):
+                j += 1
+                continue
+            break
+
+        kind = m.group("kind")
+        size_bits = int(m.group("size")) if m.group("size") else 8
+        if kind == "CheckBox":
+            options = dict(CHECKBOX_OPTIONS)
+        questions.append({
+            "kind": kind,
+            "prompt": m.group("prompt"),
+            "help": m.group("help"),
+            "qid": m.group("qid"),
+            "vsid": int(m.group("vsid"), 16),
+            "voff": int(m.group("voff"), 16),
+            "size_bytes": max(1, size_bits // 8),
+            "options": options,
+            "default": m.group("default"),
+            "mfgdefault": m.group("mfgdefault"),
+            "min": int(m.group("min"), 16) if m.group("min") else None,
+            "max": int(m.group("max"), 16) if m.group("max") else None,
+            "step": int(m.group("step"), 16) if m.group("step") else None,
+        })
+        i = j
+    return questions
+
+
+class _EfiBlob:
+    """Duck-types the bits of Path that read_value/len() need, for live bytes
+    held in memory rather than on disk."""
+    def __init__(self, name, data):
+        self._name = name
+        self._data = data
+    def read_bytes(self):
+        return self._data
+    def __str__(self):
+        return f"<live efivars:{self._name}>"
+
+
+EFIVARS = {}
+EFIVARS_USED = set()
+EFIVARS_SKIPPED = set()
+
+def load_efivars(src: Path):
+    """Map NVRAM store name -> live bytes, from a PC-Doctor efivars capture
+    (<MODEL>_efivars.tar.gz, or an already-extracted directory).
+
+    efivarfs files are named "<StoreName>-<GUID>" and begin with a 4-byte
+    attribute header that is NOT part of the store data - strip it.
+
+    These bytes are the LIVE NVRAM, the same thing AMI's SCEWIN reads through
+    its driver. A flash image only carries the StdDefaults template, so this is
+    the only way to decode a booted unit's real settings without a vendor tool.
+    """
+    import tarfile, tempfile
+    if not src or not src.exists():
+        return {}
+    d = src
+    tmp = None
+    if src.is_file():
+        tmp = tempfile.mkdtemp(prefix="efivars-")
+        try:
+            with tarfile.open(src) as tf:
+                tf.extractall(tmp)
+        except Exception as e:
+            print(f"[warn] could not read efivars capture {src}: {e}", file=sys.stderr)
+            return {}
+        d = Path(tmp)
+    out = {}
+    for f in d.rglob("*-*"):
+        if not f.is_file():
+            continue
+        stem = f.name
+        # strip the trailing 5-group GUID to get the store name
+        parts = stem.rsplit("-", 5)
+        if len(parts) != 6:
+            continue
+        name = parts[0]
+        try:
+            raw = f.read_bytes()
+        except OSError:
+            continue
+        if len(raw) <= 4:
+            continue
+        out.setdefault(name, raw[4:])
+    return out
+
+
+def find_store_body(dump_dir: Path, name: str):
+    """Returns (path, is_live) for a named NVRAM store's body.bin. Prefers a
+    top-level live entry; falls back to a StdDefaults/external-defaults
+    template copy if that's all the image has (e.g. a factory update image).
+
+    Must require "NVAR store" as an ancestor path component - without it, a
+    driver module that happens to share a folder name with an NVRAM store
+    (e.g. the "Setup" PE32 driver itself vs. the "Setup" NVRAM data entry)
+    gets matched instead, silently reading machine code as setting bytes."""
+    pattern = re.compile(rf"^\d+ {re.escape(name)}$")
+    live, template = None, None
+    for d in dump_dir.rglob("body.bin"):
+        if not pattern.match(d.parent.name):
+            continue
+        parts = d.parts
+        if not any(p == "NVAR store" or p.endswith(" NVAR store") for p in parts):
+            continue
+        path_str = str(d)
+        is_template = "StdDefaults" in path_str or "external defaults" in path_str.lower()
+        if is_template:
+            template = template or d
+        else:
+            live = live or d
+    if live:
+        return live, True
+    return template, False
+
+
+def read_value(body_path: Path, offset: int, size_bytes: int):
+    data = body_path.read_bytes()
+    if offset + size_bytes > len(data):
+        return None
+    return int.from_bytes(data[offset:offset + size_bytes], "little")
+
+
+def decode_named_questions(dump_dir: Path, questions, varstores):
+    blocks = []
+    resolved_stores = set()
+    body_cache = {}
+
+    for q in questions:
+        store = varstores.get(q["vsid"])
+        if not store or not store["name"]:
+            continue
+        name = store["name"]
+        if name not in body_cache:
+            body_cache[name] = find_store_body(dump_dir, name)
+        body_path, is_live = body_cache[name]
+        if not body_path:
+            continue
+        # A captured efivars blob for this store outranks anything in the image:
+        # it is the booted unit's live NVRAM. Guarded on an exact size match
+        # against the image's own copy of the store -- the IFR offsets are only
+        # valid for a store of that exact length, and silently decoding at the
+        # wrong offsets is precisely how the "PE32 driver read as NVRAM" bug
+        # produced confident garbage. On mismatch, fall back and say so.
+        if EFIVARS and name in EFIVARS:
+            live_bytes = EFIVARS[name]
+            img_len = len(body_path.read_bytes())
+            if len(live_bytes) == img_len:
+                if name not in EFIVARS_USED:
+                    EFIVARS_USED.add(name)
+                body_path = _EfiBlob(name, live_bytes)
+                is_live = True
+            elif name not in EFIVARS_SKIPPED:
+                EFIVARS_SKIPPED.add(name)
+                print(f"[warn] efivars '{name}' is {len(live_bytes)} bytes but the image's "
+                      f"store is {img_len} - IFR offsets would not line up, so the live "
+                      f"bytes were NOT used for this store.", file=sys.stderr)
+
+        raw = read_value(body_path, q["voff"], q["size_bytes"])
+        if raw is None:
+            continue
+
+        resolved_stores.add(name)
+        label = q["options"].get(raw)
+        if label:
+            value_str = label
+        elif q["kind"] == "Numeric":
+            # No discrete Options for a Numeric field by design (it's a range,
+            # not an enum) - show the decimal value plus the BIOS's own
+            # Min/Max/Step so a bare number isn't the only thing on offer.
+            value_str = str(raw)
+            if q["min"] is not None and q["max"] is not None:
+                range_str = f"range {q['min']}-{q['max']}"
+                if q["step"]:
+                    range_str += f" step {q['step']}"
+                value_str += f" ({range_str})"
+        else:
+            # OneOf/CheckBox whose byte value didn't match any known option -
+            # shown as-is rather than guessed at.
+            value_str = f"0x{raw:X}"
+
+        # Help text isn't just a Numeric-only nicety - some questions have a
+        # genuinely EMPTY compiled Prompt (StringId 0x0) but a real Help
+        # string that's the only textual description that exists anywhere
+        # in the BIOS for them. Confirmed on a real TB-6293 image: several
+        # blank-Prompt OneOf questions carry Help text like "Mass storage
+        # device emulation type..." - previously only ever shown for
+        # Numeric, silently dropping the one clue available for these.
+        help_line = f"\nHelp = {q['help']}" if q["help"] else ""
+
+        prompt_display = q["prompt"].strip() if q["prompt"].strip() else "(no label in BIOS form)"
+
+        source_tag = "" if is_live else " [DEFAULTS TEMPLATE, not live]"
+
+        blocks.append(
+            f"Token = IFR:{q['qid']}:{name}:0x{q['voff']:X}\n"
+            f"Setup Question = {prompt_display}{source_tag}\n"
+            f"Value of Question = {value_str}{help_line}"
+        )
+    return blocks, resolved_stores
+
+
+def decode_opaque_fallback(nvar_entries, already_resolved_names):
+    blocks = []
+    for key, e in sorted(nvar_entries.items()):
+        if e["name"] in already_resolved_names:
+            continue
+        token = f"NVAR:{e['guid']}:{e['name']}"
+        blocks.append(
+            f"Token = {token}\n"
+            f"Setup Question = [NVRAM store] {e['name']} (opaque, size=0x{e['size']})\n"
+            f"Value of Question = crc32:{e['crc']}"
+        )
+    return blocks
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("bin_path", type=Path)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--serial", required=True)
+    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--efivars", type=Path, default=None,
+                    help="PC-Doctor efivars capture (<MODEL>_efivars.tar.gz or an "
+                         "extracted dir). Overlays the booted unit's LIVE NVRAM onto "
+                         "the IFR catalog instead of the image's StdDefaults template. "
+                         "Per-store, and only when the size matches the image exactly.")
+    args = ap.parse_args()
+
+    global EFIVARS
+    if args.efivars:
+        EFIVARS = load_efivars(args.efivars)
+        if EFIVARS:
+            print(f"loaded {len(EFIVARS)} live UEFI variables from {args.efivars}", file=sys.stderr)
+        else:
+            print(f"[warn] no usable UEFI variables found in {args.efivars} - "
+                  f"falling back to the image's own stores", file=sys.stderr)
+
+    if not args.bin_path.exists():
+        print(f"error: {args.bin_path} not found", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="bios-decode-") as tmp:
+        workdir = Path(tmp)
+        print("running uefiextract (full tree dump)...", file=sys.stderr)
+        dump_dir, report = uefiextract_all(args.bin_path, workdir)
+        nvar_entries = parse_nvar_entries(report)
+
+        print("locating the Setup form driver module...", file=sys.stderr)
+        setup_module = find_setup_module(dump_dir)
+
+        named_blocks, resolved_names = [], set()
+        if setup_module:
+            print(f"found: {setup_module.relative_to(dump_dir)}", file=sys.stderr)
+            catalog_text = extract_ifr_catalog(setup_module)
+            if catalog_text:
+                catalog_text = join_wrapped_question_lines(catalog_text)
+                varstores = parse_varstores(catalog_text)
+                questions = parse_questions(catalog_text)
+                print(f"catalog: {len(varstores)} var stores, {len(questions)} questions", file=sys.stderr)
+                named_blocks, resolved_names = decode_named_questions(dump_dir, questions, varstores)
+        else:
+            print("warning: no Setup form driver found - falling back to opaque CRC only", file=sys.stderr)
+
+        opaque_blocks = decode_opaque_fallback(nvar_entries, resolved_names)
+
+    all_blocks = named_blocks + opaque_blocks
+    if not all_blocks:
+        print("error: nothing decodable - is this really an AMI Aptio image?", file=sys.stderr)
+        return 2
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_dir = args.out or (CAPTURES_DIR / args.model)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{args.model}__{args.serial}__{stamp}.txt"
+    out_path.write_text("\n\n".join(all_blocks) + "\n")
+    # This may run as the timer user or as the web server user (the PHP
+    # upload handler) - both in a shared group, but a restrictive
+    # umask (022) otherwise strips group WRITE, leaving other callers unable
+    # to manage the file without sudo. Force it open regardless of whoever
+    # ran this. Non-fatal: a permission quirk here shouldn't fail the decode
+    # that already succeeded.
+    try:
+        os.chmod(out_dir, 0o2775)
+        os.chmod(out_path, 0o664)
+    except OSError:
+        pass
+
+    print(f"decoded {len(named_blocks)} named settings + {len(opaque_blocks)} opaque store CRCs -> {out_path}")
+    print(f"diff: bios-settings-diff {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

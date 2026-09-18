@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""N-way BIOS settings comparison. Takes 2+ capture files (SCEWIN nvram.txt
+or bios-settings-decode output) and emits a JSON matrix: one row per unique
+setting (matched by Token), one column per input file, flagging which rows
+differ across the selected files.
+
+Usage:
+    bios-settings-compare FILE1 FILE2 [FILE3 ...] [--labels "L1" "L2" ...]
+
+Output: JSON to stdout - {"files": [...], "rows": [...]}
+Exit codes: 0 = compared successfully (regardless of whether anything
+differs - that's data, not an error), 2 = usage/parse error.
+"""
+import argparse
+import difflib
+import json
+import re
+import sys
+from pathlib import Path
+
+TOKEN_RE = re.compile(r"Token\s*=\s*(\S+)")
+QUESTION_RE = re.compile(r"Setup Question\s*=\s*(.+)")
+CURRENT_OPTION_RE = re.compile(r"\*\s*\[([0-9A-Fa-f]+)\]\s*([^\r\n/]*)")
+VALUE_FALLBACK_RE = re.compile(r"Value(?: of Question)?\s*=\s*(.+)")
+HELP_RE = re.compile(r"^Help\s*=\s*(.+)", re.MULTILINE)
+# bios-settings-decode stamps this on every row of a capture that came from
+# a BIOS UPDATE FILE (uploaded) rather than a live unit's flashrom dump
+# (auto-decoded from a real PC-Doctor result) - it's a per-FILE fact, not a
+# per-setting one, so repeating it on every single row (confirmed: 4619
+# times, identically, in one real comparison) is pure noise. Stripped here
+# and reported once per file instead - see main()'s "source" field.
+TEMPLATE_TAG_RE = re.compile(r"\s*\[DEFAULTS TEMPLATE, not live\]", re.IGNORECASE)
+
+
+def parse_capture(path: Path):
+    """Same block format bios-settings-diff reads. Returns
+    (dict[token] = {question, value, help}, template_count, total_count)."""
+    text = path.read_text(errors="replace")
+    blocks = re.split(r"\r?\n\s*\r?\n", text)
+    settings = {}
+    template_count = 0
+    total = 0
+    for block in blocks:
+        if not block.strip():
+            continue
+        tok_m = TOKEN_RE.search(block)
+        if not tok_m:
+            continue
+        token = tok_m.group(1).lower()
+        q_m = QUESTION_RE.search(block)
+        question = q_m.group(1).strip() if q_m else f"(unnamed, token {token})"
+
+        total += 1
+        if TEMPLATE_TAG_RE.search(question):
+            template_count += 1
+            question = TEMPLATE_TAG_RE.sub("", question).strip()
+
+        val_m = CURRENT_OPTION_RE.search(block)
+        if val_m:
+            value = f"[{val_m.group(1)}]{val_m.group(2).strip()}"
+        else:
+            vf_m = VALUE_FALLBACK_RE.search(block)
+            value = vf_m.group(1).strip() if vf_m else None
+
+        help_m = HELP_RE.search(block)
+        help_text = help_m.group(1).strip() if help_m else ""
+
+        settings[token] = {"question": question, "value": value, "help": help_text}
+    return settings, template_count, total
+
+
+def _ifr_store_offset(token):
+    parts = token.split(":")
+    return (parts[2], parts[3]) if len(parts) >= 4 and parts[0] == "ifr" else None
+
+
+def consolidate_within_file(settings):
+    """Some BIOS builds expose the SAME physical byte through two different
+    internal QuestionIds - confirmed real case: TB-7393's "External 32kHz
+    Clock" exists as both QuestionId 0x186 and 0x19E, both at Setup:0x9F9,
+    within one single build (not a cross-build thing at all). Safe to
+    collapse unconditionally: same (store, offset) within one file is
+    deterministically the same physical byte - unlike matching QuestionId
+    or offset ACROSS different builds, where the same number can
+    coincidentally mean something else (see merge_cross_build_matches).
+
+    This has to run before cross-build matching, not after: left alone, a
+    within-file duplicate compounds with a cross-build offset shift into an
+    unresolvable 2-candidates-per-file situation that the cross-build passes
+    correctly refuse to touch (their ambiguity guard requires at most one
+    candidate per file) - confirmed real symptom: "External 32kHz Clock"
+    showed as 4 disconnected half-empty rows instead of one that agrees."""
+    by_store_offset = {}
+    for token in settings:
+        key = _ifr_store_offset(token)
+        if key is not None:
+            by_store_offset.setdefault(key, []).append(token)
+
+    consolidated = dict(settings)
+    for tokens in by_store_offset.values():
+        if len(tokens) < 2:
+            continue
+        primary = tokens[0]
+        entry = dict(consolidated[primary])
+        entry["display_token"] = "+".join(tokens)
+        consolidated[primary] = entry
+        for t in tokens[1:]:
+            del consolidated[t]
+    return consolidated
+
+
+def token_sort_key(token, captures):
+    for c in captures:
+        if token in c:
+            return (c[token]["question"] or "").lower()
+    return token
+
+
+def _ifr_parts(token):
+    parts = token.split(":")
+    return parts if len(parts) >= 4 and parts[0] == "ifr" else None
+
+
+def _norm_prompt(row):
+    return (row["prompt"] or "").strip().lower()
+
+
+def _key_qid_store(row):
+    """Same QuestionId + store AND same name - offset ignored. Confirmed
+    real case: TB-7393 "Stop Bits" kept QuestionId 0x673/0x67D in both
+    builds, but the byte offset shifted (0xD0F/0xD10 -> 0xD0B/0xD0C) -
+    something earlier in the form grew or shrank. QuestionId is the more
+    stable identity here.
+
+    The name check is NOT optional, even though QuestionId already looks
+    like a strong signal - confirmed real counter-case on the same TB-7393
+    pair: QuestionId 0x89 meant "SAR 2400 MHz Set1 Chain A" (a WiFi power
+    calibration number) in one build and the totally unrelated "11Ax Mode
+    for Russia" (a regulatory toggle) in the other. The compiler reuses ID
+    numbers across independently-built images; without also requiring the
+    name to agree, this pass would have silently spliced two unrelated
+    settings' values into one nonsense row."""
+    parts = _ifr_parts(row["token"])
+    return ("qid", parts[1], parts[2], _norm_prompt(row)) if parts else None
+
+
+def _key_store_offset(row):
+    """Same store + offset AND same name - QuestionId ignored. Confirmed
+    real case: TB-7393 "State After G3" kept offset 0x20 in PchSetup in both
+    builds, but QuestionId was renumbered (0x61 -> 0x62) - the reverse
+    situation from Stop Bits. Neither signal is reliably "the" stable one,
+    so both get tried. Same false-merge risk as qid+store above applies here
+    too (a coincidentally-reused offset meaning something else in the other
+    build) - the name check guards against it the same way."""
+    parts = _ifr_parts(row["token"])
+    return ("off", parts[2], parts[3], _norm_prompt(row)) if parts else None
+
+
+def _key_prompt(row):
+    """Weakest signal - matches purely on displayed name (case/whitespace
+    normalized), no positional information at all. Confirmed real case:
+    TB-7393 "11Ax Mode for Russia" changed BOTH QuestionId (0x87->0x89) and
+    offset (0xA70->0xA6F) between builds - only the name ties the two
+    together. Tried last, after the two more precise signals above have
+    already claimed what they can, so this only ever sees what neither
+    could resolve - keeps its false-positive surface as small as possible."""
+    return ("prompt", _norm_prompt(row))
+
+
+def reconcile_pass(rows, idxs, key_func, num_files, method):
+    groups = {}
+    for i in idxs:
+        k = key_func(rows[i])
+        if k is None:
+            continue
+        groups.setdefault(k, []).append(i)
+
+    merged = []
+    consumed = set()
+    for _, group_idxs in groups.items():
+        if len(group_idxs) < 2:
+            continue
+        file_hit_count = [0] * num_files
+        for i in group_idxs:
+            for fi, v in enumerate(rows[i]["values"]):
+                if v is not None:
+                    file_hit_count[fi] += 1
+        if any(c > 1 for c in file_hit_count):
+            continue  # ambiguous - more than one candidate from the same file
+        if sum(1 for c in file_hit_count if c > 0) < 2:
+            continue  # only one file has this at all - not a cross-build match
+
+        merged_values = [None] * num_files
+        tokens_involved = []
+        help_text = ""
+        prompt = None
+        for i in group_idxs:
+            tokens_involved.append(rows[i]["token"])
+            help_text = help_text or rows[i]["help"]
+            prompt = prompt or rows[i]["prompt"]
+            for fi, v in enumerate(rows[i]["values"]):
+                if v is not None:
+                    merged_values[fi] = v
+        present = [v for v in merged_values if v is not None]
+        merged.append({
+            "token": "+".join(tokens_involved),
+            "prompt": prompt,
+            "help": help_text,
+            "values": merged_values,
+            "differs": len(set(present)) > 1 or len(present) != num_files,
+            "matched_by_name": True,
+            "match_method": method,
+        })
+        consumed.update(group_idxs)
+    return merged, consumed
+
+
+def merge_cross_build_matches(rows, num_files):
+    """Token = IFR:<QuestionId>:<store>:<offset> - QuestionId and offset are
+    both compiler-assigned, and a BIOS recompile (a genuinely different
+    build, not just different NVRAM contents on the same build) can reassign
+    either or both independently. Three passes, most precise signal first,
+    each only touching what's still unmatched after the previous one:
+    same QuestionId+store (offset may have shifted), then same store+offset
+    (QuestionId may have been renumbered), then Prompt text alone (both
+    changed - the weakest signal, tried last on purpose).
+
+    Only rows that already failed to match by exact token (values contain a
+    None) are candidates - a full token match already correlates correctly
+    and isn't touched. Every pass requires it to be unambiguous: if a key
+    has more than one candidate row from the SAME file, that's very likely a
+    genuinely repeated setting (e.g. "I2C Address" x168 on a real TB-7393
+    capture, one per device) rather than a rename - left unmerged rather
+    than risk combining unrelated settings."""
+    incomplete_idx = [i for i, r in enumerate(rows) if any(v is None for v in r["values"])]
+    remaining = set(incomplete_idx)
+    all_merged = []
+
+    for key_func, method in ((_key_qid_store, "qid"), (_key_store_offset, "offset"), (_key_prompt, "name")):
+        merged, consumed = reconcile_pass(rows, list(remaining), key_func, num_files, method)
+        all_merged.extend(merged)
+        remaining -= consumed
+
+    consumed_total = set(incomplete_idx) - remaining
+    untouched = [r for i, r in enumerate(rows) if i not in consumed_total]
+    for r in untouched:
+        r.setdefault("matched_by_name", False)
+
+    return untouched + all_merged
+
+
+def sequence_align_rows(cap_a, cap_b):
+    """Alternative to token-identity matching, for comparing two genuinely
+    different BIOS BUILDS of the same reference design (not two units on
+    the same build) - real motivating case: an OEM-customized firmware vs the
+    ODM's own reference build of the identical board.
+    QuestionId and byte offset are both assigned by the compiler at BUILD
+    time; a single setting added or removed anywhere in the compiled form
+    shifts every one that comes after it, so identity-based matching
+    (merge_cross_build_matches) sees near-total non-overlap even when the
+    two builds are almost entirely the same (confirmed real case: ~9% exact
+    token overlap between "the same unit," per the user, just re-branded
+    with a handful of setting changes).
+
+    Uses the same technique `diff`/`git diff` use on text files: walk both
+    captures in their ORIGINAL COMPILED ORDER (parse_capture's dict already
+    preserves this - Python dicts keep insertion order, and blocks are
+    parsed in file order) and find the longest common subsequence, keyed on
+    normalized Setup Question text rather than Token. This correctly reads
+    as "one thing was inserted/removed here, everything after realigns"
+    instead of treating every subsequent shifted setting as unrelated.
+
+    Only handles exactly 2 captures - true N-way sequence alignment is a
+    much harder problem (multiple sequence alignment, as in bioinformatics)
+    and out of scope until this is proven useful for the 2-file case."""
+    tokens_a = list(cap_a.keys())
+    tokens_b = list(cap_b.keys())
+    keys_a = [_norm_prompt({"prompt": cap_a[t]["question"]}) for t in tokens_a]
+    keys_b = [_norm_prompt({"prompt": cap_b[t]["question"]}) for t in tokens_b]
+
+    matcher = difflib.SequenceMatcher(None, keys_a, keys_b, autojunk=False)
+    rows = []
+    matched_a, matched_b = set(), set()
+
+    def make_row(ta, tb, method):
+        entry_a = cap_a[ta] if ta is not None else None
+        entry_b = cap_b[tb] if tb is not None else None
+        question = (entry_a or entry_b)["question"]
+        help_text = (entry_a["help"] if entry_a else "") or (entry_b["help"] if entry_b else "")
+        va = entry_a["value"] if entry_a else None
+        vb = entry_b["value"] if entry_b else None
+        token_parts = [t for t in (ta, tb) if t is not None]
+        return {
+            "token": "+".join(dict.fromkeys(token_parts)),
+            "prompt": question,
+            "help": help_text,
+            "values": [va, vb],
+            "differs": va != vb,
+            "matched_by_name": ta is not None and tb is not None,
+            "match_method": method,
+        }
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for off in range(i2 - i1):
+                ta, tb = tokens_a[i1 + off], tokens_b[j1 + off]
+                matched_a.add(ta)
+                matched_b.add(tb)
+                rows.append(make_row(ta, tb, "sequence" if ta != tb else None))
+        elif tag == "replace":
+            # A locally-changed region - same normalized name doesn't hold
+            # across the whole span, but pairing positionally within it is
+            # still the best available signal (this is a small, LOCAL
+            # region by construction - SequenceMatcher already found the
+            # surrounding context matches exactly). Leftover length
+            # difference falls through to the one-sided pass below.
+            for off in range(min(i2 - i1, j2 - j1)):
+                ta, tb = tokens_a[i1 + off], tokens_b[j1 + off]
+                matched_a.add(ta)
+                matched_b.add(tb)
+                rows.append(make_row(ta, tb, "sequence-positional"))
+        # 'insert'/'delete' opcodes: nothing to do here, handled by the
+        # one-sided sweep below - keeps this branch simple and avoids
+        # duplicating that logic per-opcode.
+
+    for t in tokens_a:
+        if t not in matched_a:
+            rows.append(make_row(t, None, None))
+    for t in tokens_b:
+        if t not in matched_b:
+            rows.append(make_row(None, t, None))
+
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("files", nargs="+", type=Path)
+    ap.add_argument("--labels", nargs="*", default=None, help="Display label per file, same order as files")
+    ap.add_argument("--identity", action="store_true",
+                     help="Force exact-Token identity matching even for a 2-file comparison, skipping "
+                          "build-order/sequence alignment (the default for exactly 2 files). Use this "
+                          "when comparing two units on the SAME BIOS build and you want raw byte-for-byte "
+                          "token matching rather than order-based alignment.")
+    args = ap.parse_args()
+
+    if len(args.files) < 2:
+        print("error: need at least 2 files to compare", file=sys.stderr)
+        return 2
+
+    # Sequence/build-order alignment only makes sense - and is only
+    # implemented - for exactly 2 files (true N-way sequence alignment is a
+    # much harder problem, out of scope). Measured real result on an actual
+    # OEM/ODM build pair: identity matched 75% of settings and reported
+    # 1468 "differing"; sequence matched 99.7% and found the real 30 - so
+    # this is the default whenever it's applicable, not an opt-in.
+    args.sequence = len(args.files) == 2 and not args.identity
+
+    for f in args.files:
+        if not f.exists():
+            print(f"error: {f} not found", file=sys.stderr)
+            return 2
+
+    labels = args.labels if args.labels and len(args.labels) == len(args.files) else [f.stem for f in args.files]
+
+    captures = []
+    sources = []
+    for f in args.files:
+        parsed, template_count, total = parse_capture(f)
+        if not parsed:
+            print(f"error: no parseable settings in {f}", file=sys.stderr)
+            return 2
+        captures.append(consolidate_within_file(parsed))
+        # A handful of opaque CRC-only entries (decode_opaque_fallback in
+        # bios-settings-decode) never carry this tag either way, regardless
+        # of live/template status - exact 0%/100% would misfire "mixed" on
+        # an otherwise uniform file over just those few rows. Majority vote
+        # instead.
+        ratio = template_count / max(1, total)
+        if ratio < 0.1:
+            sources.append("live")
+        elif ratio > 0.9:
+            sources.append("template")
+        else:
+            sources.append("mixed")
+
+    all_tokens = set()
+    for c in captures:
+        all_tokens.update(c.keys())
+
+    if args.sequence:
+        rows = sequence_align_rows(captures[0], captures[1])
+    else:
+        rows = []
+        for token in sorted(all_tokens, key=lambda t: token_sort_key(t, captures)):
+            values = []
+            question = None
+            help_text = ""
+            display_token = token
+            present_values = []
+            for c in captures:
+                entry = c.get(token)
+                if entry:
+                    values.append(entry["value"])
+                    present_values.append(entry["value"])
+                    question = question or entry["question"]
+                    help_text = help_text or entry["help"]
+                    if "display_token" in entry:
+                        display_token = entry["display_token"]
+                else:
+                    values.append(None)
+            differs = len(set(present_values)) > 1 or len(present_values) != len(captures)
+            rows.append({
+                "token": display_token,
+                "prompt": question,
+                "help": help_text,
+                "values": values,
+                "differs": differs,
+            })
+
+    # Mops up genuine one-off reordering sequence alignment can't handle by
+    # construction (LCS assumes relative order is preserved - a setting
+    # that moved to a different menu page violates that) using the same
+    # safe, unambiguous-only name/qid/offset matching as the identity path.
+    rows = merge_cross_build_matches(rows, len(captures))
+
+    # Differing rows first, then alphabetical - most useful ordering for a
+    # tech scanning for what changed.
+    rows.sort(key=lambda r: (not r["differs"], (r["prompt"] or "").lower()))
+
+    matched_rows = sum(1 for r in rows if all(v is not None for v in r["values"]))
+    match_ratio = matched_rows / max(1, len(rows))
+    warning = None
+    if args.sequence:
+        if match_ratio < 0.5:
+            warning = (f"Only {match_ratio:.0%} of settings could be aligned even by compiled order - "
+                       f"these two builds likely differ enough (added/removed whole sections, or "
+                       f"reordered menus) that this isn't just a shifted-offset problem anymore.")
+    else:
+        # Low overlap means these are very likely different BIOS builds, not
+        # just different settings on the same build - confirmed on a real
+        # pair of TB-7393 captures at ~16% overlap. Warn rather than let the
+        # huge differing count and leftover unmatched rows look like a bug.
+        overlap = len(all_tokens and set.intersection(*(set(c.keys()) for c in captures)) or set())
+        overlap_ratio = overlap / max(1, len(all_tokens))
+        if overlap_ratio < 0.5:
+            extra = (" This was run with --identity forced; the default build-order mode "
+                     "usually handles this far better if these are two different BIOS builds "
+                     "of the same reference design (e.g. an OEM/ODM variant), not just two "
+                     "units on the same build.") if len(args.files) == 2 else ""
+            warning = (f"Only {overlap_ratio:.0%} of settings matched by exact identity across these "
+                       f"files - they're very likely different BIOS builds/versions, not just "
+                       f"different values on the same build. Rows found under matching names but "
+                       f"different internal IDs were reconciled where unambiguous; anything left "
+                       f"unmatched below may just not exist in the other build(s).{extra}")
+
+    result = {
+        "files": [{"label": lbl, "path": str(f), "source": src} for lbl, f, src in zip(labels, args.files, sources)],
+        "rows": rows,
+        "total": len(rows),
+        "differing": sum(1 for r in rows if r["differs"]),
+        "matched": matched_rows,
+        "mode": "sequence" if args.sequence else "identity",
+        "warning": warning,
+    }
+    print(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

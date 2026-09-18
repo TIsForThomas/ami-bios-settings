@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Diff AMI BIOS setup captures (SCEWIN nvram.txt or bios-settings-decode output)
+against a per-model golden baseline, or against each other for before/after checks.
+
+Usage:
+    bios-settings-diff CAPTURE.txt                    # diff vs golden/<MODEL>.txt
+    bios-settings-diff CAPTURE.txt --against OTHER.txt  # diff two arbitrary captures
+    bios-settings-diff CAPTURE.txt --set-golden        # promote CAPTURE.txt to golden baseline
+
+CAPTURE.txt is expected to be named MODEL__SERIAL__TIMESTAMP.txt (as written by
+Capture-BiosSettings.ps1). If it isn't, --model must be given.
+
+Exit codes: 0 = no unexpected changes, 1 = unexpected changes found, 2 = usage/parse error.
+"""
+import argparse
+import re
+import sys
+from datetime import datetime
+import os
+from pathlib import Path
+
+# Root of the captures/golden tree. Override with BIOS_SETTINGS_HOME.
+BASE = Path(os.environ.get("BIOS_SETTINGS_HOME",
+                           Path.home() / ".local/share/bios-settings"))
+GOLDEN_DIR = BASE / "golden"
+REPORTS_DIR = BASE / "reports"
+EXCLUDE_FILE = BASE / "config" / "excluded_fields.txt"
+
+TOKEN_RE = re.compile(r"Token\s*=\s*(\S+)")
+QUESTION_RE = re.compile(r"Setup Question\s*=\s*(.+)")
+CURRENT_OPTION_RE = re.compile(r"\*\s*\[([0-9A-Fa-f]+)\]\s*([^\r\n/]*)")
+VALUE_FALLBACK_RE = re.compile(r"Value(?: of Question)?\s*=\s*(.+)")
+
+
+def load_exclude_patterns():
+    if not EXCLUDE_FILE.exists():
+        return []
+    patterns = []
+    for line in EXCLUDE_FILE.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        patterns.append(line.lower())
+    return patterns
+
+
+def is_excluded(question, patterns):
+    q = (question or "").lower()
+    return any(p in q for p in patterns)
+
+
+def parse_capture(path: Path):
+    """Returns dict[token] = {"question": str, "value": str, "raw": str} plus
+    a list of unparsed block texts (blocks with no Token found at all)."""
+    text = path.read_text(errors="replace")
+    blocks = re.split(r"\r?\n\s*\r?\n", text)
+    settings = {}
+    unparsed = []
+    seen_any_token = False
+
+    for block in blocks:
+        if not block.strip():
+            continue
+        tok_m = TOKEN_RE.search(block)
+        if not tok_m:
+            # Not every block is a setting (header/footer noise) - only flag
+            # as unparsed if it looks like it was trying to be a question.
+            if QUESTION_RE.search(block):
+                unparsed.append(block.strip())
+            continue
+        seen_any_token = True
+        token = tok_m.group(1).lower()
+        q_m = QUESTION_RE.search(block)
+        question = q_m.group(1).strip() if q_m else f"(unnamed, token {token})"
+
+        val_m = CURRENT_OPTION_RE.search(block)
+        if val_m:
+            value = f"[{val_m.group(1)}]{val_m.group(2).strip()}"
+        else:
+            vf_m = VALUE_FALLBACK_RE.search(block)
+            if vf_m:
+                value = vf_m.group(1).strip()
+            else:
+                unparsed.append(block.strip())
+                value = None
+
+        settings[token] = {"question": question, "value": value, "raw": block.strip()}
+
+    if not seen_any_token:
+        print(f"warning: {path} - no 'Token =' lines found at all; is this really "
+              f"a SCEWIN nvram.txt export?", file=sys.stderr)
+
+    return settings, unparsed
+
+
+def parse_model_serial_from_filename(path: Path):
+    stem = path.stem
+    parts = stem.split("__")
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return None, None
+
+
+def diff_settings(golden, current, exclude_patterns):
+    unexpected = []
+    expected_variance = []
+    added = []
+    removed = []
+
+    golden_tokens = set(golden)
+    current_tokens = set(current)
+    common = golden_tokens & current_tokens
+
+    overlap_ratio = len(common) / max(1, len(golden_tokens))
+    if overlap_ratio < 0.5:
+        print(f"warning: only {overlap_ratio:.0%} of golden baseline's settings "
+              f"exist in this capture - baselines may be from different BIOS "
+              f"versions/models. Diff below may be noisy.", file=sys.stderr)
+
+    for token in sorted(common):
+        g = golden[token]
+        c = current[token]
+        if g["value"] != c["value"]:
+            row = (c["question"] or g["question"], g["value"], c["value"])
+            if is_excluded(c["question"] or g["question"], exclude_patterns):
+                expected_variance.append(row)
+            else:
+                unexpected.append(row)
+
+    for token in sorted(current_tokens - golden_tokens):
+        added.append((current[token]["question"], current[token]["value"]))
+
+    for token in sorted(golden_tokens - current_tokens):
+        removed.append((golden[token]["question"], golden[token]["value"]))
+
+    return unexpected, expected_variance, added, removed
+
+
+def format_report(capture_path, golden_path, unexpected, expected_variance,
+                   added, removed, unparsed_current):
+    lines = []
+    lines.append(f"BIOS settings diff report")
+    lines.append(f"Generated: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"Baseline:  {golden_path}")
+    lines.append(f"Capture:   {capture_path}")
+    lines.append("")
+
+    lines.append(f"== UNEXPECTED CHANGES ({len(unexpected)}) ==")
+    if unexpected:
+        for question, gv, cv in unexpected:
+            lines.append(f"  {question}")
+            lines.append(f"      baseline: {gv}")
+            lines.append(f"      current:  {cv}")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    if added:
+        lines.append(f"== SETTINGS PRESENT ONLY IN CAPTURE ({len(added)}) ==")
+        for question, v in added:
+            lines.append(f"  {question} = {v}")
+        lines.append("")
+
+    if removed:
+        lines.append(f"== SETTINGS PRESENT ONLY IN BASELINE ({len(removed)}) ==")
+        for question, v in removed:
+            lines.append(f"  {question} = {v}")
+        lines.append("")
+
+    if added or removed:
+        lines.append("  (added/removed settings usually mean a different BIOS "
+                      "version or model than the baseline - not necessarily tampering)")
+        lines.append("")
+
+    lines.append(f"== EXPECTED VARIANCE, informational only ({len(expected_variance)}) ==")
+    if expected_variance:
+        for question, gv, cv in expected_variance:
+            lines.append(f"  {question}: {gv} -> {cv}")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    if unparsed_current:
+        lines.append(f"== UNPARSED BLOCKS IN CAPTURE ({len(unparsed_current)}) ==")
+        lines.append("  These looked like settings but didn't match the expected "
+                      "format - not included in the diff above. Check manually.")
+        for b in unparsed_current:
+            lines.append("  ---")
+            for l in b.splitlines():
+                lines.append(f"    {l}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("capture", type=Path, help="Capture file to check (SCEWIN nvram.txt export)")
+    ap.add_argument("--against", type=Path, help="Diff against this file instead of the golden baseline")
+    ap.add_argument("--model", help="Override model name (default: parsed from MODEL__SERIAL__TIMESTAMP.txt filename)")
+    ap.add_argument("--set-golden", action="store_true", help="Promote this capture to be the model's golden baseline")
+    args = ap.parse_args()
+
+    if not args.capture.exists():
+        print(f"error: {args.capture} not found", file=sys.stderr)
+        return 2
+
+    model, serial = parse_model_serial_from_filename(args.capture)
+    model = args.model or model
+    if not model and not args.against:
+        print("error: couldn't determine model from filename, pass --model", file=sys.stderr)
+        return 2
+
+    current, unparsed_current = parse_capture(args.capture)
+    if not current:
+        print(f"error: no parseable settings found in {args.capture}", file=sys.stderr)
+        return 2
+
+    if args.set_golden:
+        GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+        golden_path = GOLDEN_DIR / f"{model}.txt"
+        if golden_path.exists():
+            backup = golden_path.with_suffix(f".txt.bak_{datetime.now():%Y-%m-%d}")
+            golden_path.rename(backup)
+            print(f"existing baseline backed up to {backup}")
+        golden_path.write_text(args.capture.read_text(errors="replace"))
+        print(f"promoted {args.capture} to golden baseline: {golden_path}")
+        return 0
+
+    if args.against:
+        golden_path = args.against
+    else:
+        golden_path = GOLDEN_DIR / f"{model}.txt"
+        if not golden_path.exists():
+            print(f"error: no golden baseline for model '{model}' at {golden_path}\n"
+                  f"capture a known-good unit first and run with --set-golden", file=sys.stderr)
+            return 2
+
+    golden, unparsed_golden = parse_capture(golden_path)
+    if not golden:
+        print(f"error: no parseable settings found in baseline {golden_path}", file=sys.stderr)
+        return 2
+
+    exclude_patterns = load_exclude_patterns()
+    unexpected, expected_variance, added, removed = diff_settings(golden, current, exclude_patterns)
+
+    report = format_report(args.capture, golden_path, unexpected, expected_variance,
+                            added, removed, unparsed_current)
+    print(report)
+
+    if model and serial:
+        out_dir = REPORTS_DIR / model / serial
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        out_path = out_dir / f"{stamp}_diff.txt"
+        out_path.write_text(report)
+        print(f"\nreport saved: {out_path}", file=sys.stderr)
+
+    return 1 if unexpected else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

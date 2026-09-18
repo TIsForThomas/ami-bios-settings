@@ -1,0 +1,10 @@
+# Never commit real captures or firmware images: they carry unit serials,
+# and a flash dump can contain UEFI variables and keys.
+captures/
+golden/
+reports/
+*.bin
+*.rom
+*.decoded
+__pycache__/
+*.pyc
